@@ -37,12 +37,48 @@ def paypal_client(monkeypatch):
                 },
             )
 
+        if (
+            request.method == "GET"
+            and request.url.path == "/v2/checkout/orders/TEST_ORDER_123"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "TEST_ORDER_123",
+                    "status": "APPROVED",
+                    "purchase_units": [
+                        {
+                            "amount": {
+                                "currency_code": "USD",
+                                "value": "500.00",
+                            }
+                        }
+                    ],
+                },
+            )
+
         if request.url.path.endswith("/capture"):
             return httpx.Response(
                 201,
                 json={
                     "id": "TEST_ORDER_123",
                     "status": "COMPLETED",
+                    "purchase_units": [
+                        {
+                            "payments": {
+                                "captures": [
+                                    {
+                                        "id": "TEST_CAPTURE_123",
+                                        "status": "COMPLETED",
+                                        "amount": {
+                                            "currency_code": "USD",
+                                            "value": "500.00",
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ],
                 },
             )
 

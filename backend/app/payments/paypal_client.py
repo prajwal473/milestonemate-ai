@@ -33,7 +33,7 @@ class PayPalClient:
             or parsed_url.password is not None
         ):
             raise ValueError("Only PayPal Sandbox is supported.")
-        self.http = httpx.Client(           
+        self.http = httpx.Client(
             base_url=self.api_base,
             timeout=httpx.Timeout(15.0, connect=5.0),
             transport=transport,
