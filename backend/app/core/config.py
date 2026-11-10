@@ -17,6 +17,20 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.8-flash"
+    # Payment configuration
+    payments_mode: str = "mock"
+
+    paypal_api_base: str = "https://api-m.sandbox.paypal.com"
+    paypal_client_id: str | None = None
+    paypal_client_secret: str | None = None
+    paypal_webhook_id: str | None = None
+
+    payee_mode: str = "demo_merchant"
+    paypal_brand_name: str = "MilestoneMate AI"
+
+    frontend_base_url: str = "http://localhost:5173"
+
+    allow_unverified_webhooks_in_mock: bool = False
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

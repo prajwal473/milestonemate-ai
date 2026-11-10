@@ -7,6 +7,8 @@ from app.models.entities import (
     Deliverable,
     Evaluation,
     Payment,
+    PaymentEvent,
+    PayPalWebhookEvent,
 )
 
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     "Deliverable",
     "Evaluation",
     "Payment",
+    "PaymentEvent",
+    "PayPalWebhookEvent",
 ]
