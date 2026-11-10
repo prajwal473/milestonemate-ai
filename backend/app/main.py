@@ -11,7 +11,10 @@ from app.routers.users import router as users_router
 from app.routers.auth import router as auth_router
 from app.routers.projects import router as projects_router
 from app.routers.evaluations import router as evaluations_router
-
+from app.routers.payments import router as payments_router
+from app.routers.payments import project_ledger_router
+from app.routers.webhooks import router as webhooks_router
+from app.routers.mock_paypal import router as mock_paypal_router
 app = FastAPI(
     title=settings.app_name,
     description="AI-powered milestone project agreements and payment management.",
@@ -25,6 +28,11 @@ app.include_router(agreements_router)
 app.include_router(milestones_router)
 app.include_router(deliverables_router)
 app.include_router(evaluations_router)
+app.include_router(payments_router)
+app.include_router(project_ledger_router)
+app.include_router(webhooks_router)
+if settings.payments_mode.lower() == "mock":
+    app.include_router(mock_paypal_router)
 
 
 @app.get("/")

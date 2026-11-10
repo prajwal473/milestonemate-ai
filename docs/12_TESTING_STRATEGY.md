@@ -123,3 +123,9 @@ Pre-recording checklist: sandbox buyer funded and logged in; LLM key valid and q
 
 ## 12. Exit criteria for release (`v1.0`)
 All P0 requirements verified; CI green; payment matrix P1-P14 pass; webhook W1-W10 pass; AI thresholds met; no open `blocker`; test report committed; secrets scan clean.
+
+## 13. Member 4 implementation pass (2026-11-10)
+
+The available backend suite passes **99 tests**. Automated payment coverage now includes lifecycle/state validation, idempotent create/capture, mock checkout outcomes, amount mismatch failure behavior, webhook verification/deduplication/processing statuses, and refund/reversal audit behavior. The full run and its limitations are recorded in [the 2026-11-10 payment report](test-reports/2026-11-10.md).
+
+The live Sandbox matrix, staging webhook delivery, PostgreSQL concurrency cases, and browser E2E run remain unverified. This checkout has no frontend application/test scaffold or Playwright installation, and no live Sandbox operation was performed. Run the API mock flow with `backend/scripts/e2e_smoke.py` after starting the backend and setting its documented environment variables.

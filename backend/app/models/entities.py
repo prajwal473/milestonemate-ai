@@ -280,6 +280,10 @@ Index(
         "status IN ('CREATED','PENDING_APPROVAL','APPROVED',"
         "'CAPTURE_PENDING')"
     ),
+    sqlite_where=text(
+        "status IN ('CREATED','PENDING_APPROVAL','APPROVED',"
+        "'CAPTURE_PENDING')"
+    ),
 )
 
 Index(

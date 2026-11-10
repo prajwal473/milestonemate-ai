@@ -4,6 +4,12 @@
 
 **Mission:** Make every cent-moving path correct, idempotent and verifiable, and prove the whole product works with tests and rehearsals.
 
+## Implementation pass status (2026-11-10)
+- **Implemented and automated:** payment service hardening, provider amount checks, mock checkout actions, webhook verification/processing statuses, payment ledger API, isolated payment UI components, API smoke runner, Sandbox spike script, and payment security/state tests. See [the implementation report](../docs/test-reports/2026-11-10.md).
+- **Verified locally:** full available backend suite, 99 passing tests.
+- **Still requires integration/manual access:** frontend shell and API client integration; Playwright execution; PayPal Sandbox buyer/merchant credentials; public webhook URL/staging; PostgreSQL concurrency test run; Sandbox matrix and demo rehearsals.
+- No live PayPal operation was performed in this pass.
+
 > Source documents: doc 09 (ownership and contracts), doc 10 (workflow), doc 11 (roadmap). If this file and a doc disagree, fix both in the same PR.
 
 ## 1. Individual responsibilities
