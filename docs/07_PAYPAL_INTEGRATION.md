@@ -229,23 +229,32 @@ Negative testing: PayPal documents request headers to simulate error responses i
 
 ## 11. Mock mode (`PAYMENTS_MODE=mock`)
 
-`payments/mock_client.py` implements the same interface as `PayPalClient` (`create_order`, `get_order`, `capture_order`, `verify_webhook_signature`) with an in-DB fake order store. `approve_url` points to `/mock-paypal/checkout`, a page with **"Approve (SIMULATED)"** and **"Cancel"**; the UI shows a persistent yellow "SIMULATED PAYMENTS" banner. Payments created in mock mode have `provider = MOCK` and can never be confused with sandbox transactions in the ledger. Mock mode exists for judges without PayPal credentials and as a demo backup (doc 16).
+`payments/mock_client.py` implements the provider interface without making PayPal requests. The payment database row is the durable source for the simulated lifecycle; the mock order cache is rebuilt from it after an app restart. `approve_url` points to `/mock-paypal/checkout`, a page with **"Approve (SIMULATED)"**, **"Reject (SIMULATED)"**, and **"Cancel"** actions. Payments created in mock mode have `provider = MOCK` and are labelled in checkout and the payment ledger. Mock mode exists for judges without PayPal credentials and as a demo backup (doc 16). Mock webhook acceptance is disabled unless `ALLOW_UNVERIFIED_WEBHOOKS_IN_MOCK=true`; that flag is ignored in Sandbox mode.
 
 ## 12. Spike results (fill in on Day 1 - Member 4; sign-off by Member 1)
 
 | ID | Test | Expected | Result | Decision |
 |---|---|---|---|---|
-| S1 | OAuth token with sandbox creds | `200`, `access_token` | _TBD_ | - |
-| S2 | Create order with `payee.email_address` of "Second Merchant" using the Demo Merchant app credentials | Either accepted (-> `direct_payee` viable) or rejected with a permission error (-> `demo_merchant`) | _TBD_ | `PAYEE_MODE = ___` |
-| S3 | Create order with `payment_source.paypal.experience_context`; confirm status and link `rel` | `PAYER_ACTION_REQUIRED`, `payer-action` | _TBD_ | - |
-| S4 | Approve with Buyer A; show order; capture | `APPROVED` -> capture `COMPLETED` | _TBD_ | Save real capture JSON to `backend/tests/payments/fixtures/capture_completed.json` |
-| S5 | Repeat create with the same `PayPal-Request-Id` | Same order returned | _TBD_ | - |
-| S6 | Repeat capture after completion | `ORDER_ALREADY_CAPTURED` or same result | _TBD_ | map in `errors.py` |
-| S7 | Webhook delivered via tunnel; verify-signature returns `SUCCESS` | `SUCCESS` | _TBD_ | Save real event JSON + headers to fixtures |
-| S8 | Webhook simulator event verification | Likely `FAILURE` | _TBD_ | document in section 8.3 |
+| S1 | OAuth token with sandbox creds | `200`, `access_token` | Not run: no Sandbox operation was performed in this implementation pass | - |
+| S2 | Create order with `payee.email_address` of "Second Merchant" using the Demo Merchant app credentials | Either accepted (-> `direct_payee` viable) or rejected with a permission error (-> `demo_merchant`) | Not run; decision remains unverified | Keep `demo_merchant` default; obtain Member 1 sign-off before changing |
+| S3 | Create order with `payment_source.paypal.experience_context`; confirm status and link `rel` | `PAYER_ACTION_REQUIRED`, `payer-action` | Not run; use `scripts/paypal_spike.py --confirm-sandbox` manually | - |
+| S4 | Approve with Buyer A; show order; capture | `APPROVED` -> capture `COMPLETED` | Not run; manual buyer approval required | Save real capture JSON to `backend/tests/payments/fixtures/capture_completed.json` |
+| S5 | Repeat create with the same `PayPal-Request-Id` | Same order returned | Not run against PayPal; mock idempotency is covered by unit tests | - |
+| S6 | Repeat capture after completion | `ORDER_ALREADY_CAPTURED` or same result | Not run against PayPal; mock repeat capture is covered by unit tests | Map live issue code after Sandbox verification |
+| S7 | Webhook delivered via tunnel; verify-signature returns `SUCCESS` | `SUCCESS` | Not run; requires a public URL and configured Sandbox webhook | Save real event JSON + headers to fixtures |
+| S8 | Webhook simulator event verification | Likely `FAILURE` | Not run; no Sandbox webhook ID was used | Verify against the registered webhook in section 8.3 |
 
 ## 13. Sandbox testing checklist (details in doc 12)
 Happy path; cancel; decline funding source; double-click Pay; repeat capture; webhook replay; tampered webhook body; wrong `webhook_id`; capture pending (if reproducible); network failure mid-capture; amount mismatch unit test.
 
 ## 14. Judge-facing note
 README states: sandbox only; to run payments live in sandbox a judge needs their own PayPal sandbox app (instructions in README) **or** can use `PAYMENTS_MODE=mock`. Do not publish the REST secret. Sandbox *buyer* credentials may be shared in the hosted-demo instructions if the team decides (human decision list, doc 15).
+
+
+## 15. Devpost and demo copy (Member 4)
+
+**Devpost paragraph:** MilestoneMate connects accepted milestones to PayPal Orders v2 using a configured Sandbox merchant account. The client approves checkout and the backend verifies capture amounts before marking a milestone paid. Signed webhooks and a payment event ledger support reconciliation and audit history. Mock mode provides an explicitly labelled simulated checkout for demos when Sandbox credentials are unavailable. The MVP does not provide escrow, fund holding, or marketplace payouts; routing to multiple freelancer merchants would require PayPal multiparty onboarding and is not implemented.
+
+**Demo narration:** “The client pays an accepted milestone through PayPal Sandbox. After buyer approval, MilestoneMate captures the order, checks the amount against the accepted milestone, and updates the project through the shared milestone service. The ledger shows the order, capture, and verified webhook history. When Sandbox access is unavailable, the same flow can be demonstrated in clearly labelled simulated mode.”
+
+The copy describes the intended integration; the Sandbox and signed-webhook steps still require the manual checks in section 12 before claiming a verified live run.

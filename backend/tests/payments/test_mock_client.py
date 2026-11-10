@@ -26,6 +26,40 @@ def test_create_mock_order(client):
 
     assert result["status"] == "CREATED"
     assert result["id"].startswith("MOCK_ORDER_")
+    assert len(result["id"].removeprefix("MOCK_ORDER_")) == 32
+
+
+def test_checkout_actions_are_one_way(client):
+    order = client.create_order(
+        amount="10.00", currency_code="USD", reference_id="m", custom_id="p",
+        invoice_id="i", description="d", return_url="/return", cancel_url="/cancel",
+        request_id="one-way-test",
+    )
+    order_id = order["id"]
+    client.approve_order(order_id)
+    assert client.approve_order(order_id)["status"] == "APPROVED"
+    with pytest.raises(ValueError):
+        client.reject_order(order_id)
+    with pytest.raises(ValueError):
+        client.cancel_order(order_id)
+
+
+def test_rejected_or_cancelled_order_cannot_be_reapproved(client):
+    rejected = client.create_order(
+        amount="10.00", currency_code="USD", reference_id="m", custom_id="p",
+        invoice_id="i", description="d", return_url="/return", cancel_url="/cancel",
+        request_id="reject-one-way-test",
+    )
+    client.reject_order(rejected["id"])
+    with pytest.raises(ValueError):
+        client.approve_order(rejected["id"])
+    cancelled = client.create_order(
+        amount="10.00", currency_code="USD", reference_id="m", custom_id="p",
+        invoice_id="i", description="d", return_url="/return", cancel_url="/cancel",
+        request_id="cancel-one-way-test",
+    )
+    assert client.cancel_order(cancelled["id"])["status"] == "VOIDED"
+    assert client.cancel_order(cancelled["id"])["status"] == "VOIDED"
 
 
 def test_capture_mock_order(client):

@@ -1,4 +1,5 @@
 import json
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 
 from sqlalchemy.exc import IntegrityError
@@ -11,16 +12,21 @@ from app.payments.errors import (
     WebhookVerificationError,
 )
 from app.payments.paypal_client import PayPalClient
+from app.core.config import settings
 
 from decimal import Decimal
 
 from app.models import Payment, PaymentEvent
 from app.payments.state import PaymentStatus
-from app.services import audit, milestones, notifications
+from app.services import audit, notifications
 from app.payments.service import (
+    _restore_mock_order,
     _get_payment_client,
     _record_event,
     _transition_payment,
+    _persist_amount_mismatch,
+    _validate_amount_fields,
+    _mark_milestone_paid,
 )
 
 def receive_webhook(
@@ -31,31 +37,15 @@ def receive_webhook(
 ) -> dict:
     """Verify, store, and deduplicate an incoming PayPal webhook."""
 
-    client = PayPalClient()
-
-    try:
-        verification = client.verify_webhook_signature(
-            headers,
-            raw_body,
-        )
-    except Exception as exc:
-        raise WebhookVerificationError(
-            f"Webhook verification failed: {exc}"
-        ) from exc
-    finally:
-        client.close()
-
-    if verification.get("verification_status") != "SUCCESS":
-        raise WebhookVerificationError(
-            "PayPal webhook signature is invalid."
-        )
-
     try:
         event = json.loads(raw_body)
     except (UnicodeDecodeError, ValueError) as exc:
         raise WebhookVerificationError(
             "Invalid webhook JSON."
         ) from exc
+
+    if not isinstance(event, dict):
+        raise WebhookVerificationError("Webhook payload must be a JSON object.")
 
     event_id = event.get("id")
     event_type = event.get("event_type")
@@ -66,51 +56,97 @@ def receive_webhook(
         )
 
     resource = event.get("resource", {})
+    if not isinstance(resource, dict):
+        raise WebhookVerificationError("Webhook resource must be a JSON object.")
 
-    webhook_record = PayPalWebhookEvent(
-        paypal_event_id=event_id,
-        event_type=event_type,
-        resource_type=resource.get("resource_type"),
-        resource_id=resource.get("id"),
-        verification_status="SUCCESS",
-        processing_status="RECEIVED",
-        payload=event,
-        transmission_id=headers.get("paypal-transmission-id")
-        or headers.get("PAYPAL-TRANSMISSION-ID"),
-    )
+    existing = (db.query(PayPalWebhookEvent).filter_by(
+        paypal_event_id=event_id
+    ).with_for_update().first())
+    if existing and existing.verification_status == "SUCCESS":
+        if existing.processing_status != "FAILED":
+            return {"status": "duplicate", "event_id": event_id}
+
+    def store_verification(status: str, message: str | None) -> PayPalWebhookEvent:
+        record = existing or PayPalWebhookEvent(
+            paypal_event_id=event_id,
+            event_type=event_type,
+            processing_status="RECEIVED",
+            received_at=datetime.now(timezone.utc),
+        )
+        was_verified = record.verification_status == "SUCCESS"
+        if not was_verified:
+            record.event_type = event_type
+            record.resource_type = resource.get("resource_type")
+            record.resource_id = resource.get("id")
+            record.payload = event
+            record.verification_status = status
+            record.processing_status = "RECEIVED"
+            record.transmission_id = (
+                headers.get("paypal-transmission-id")
+                or headers.get("PAYPAL-TRANSMISSION-ID")
+            )
+            record.error = message
+        if existing is None:
+            db.add(record)
+        return record
 
     try:
-        db.add(webhook_record)
+        mode = settings.payments_mode.lower()
+        if mode == "mock":
+            verification = {
+                "verification_status": "SUCCESS"
+                if settings.allow_unverified_webhooks_in_mock
+                else "FAILURE"
+            }
+        else:
+            client = PayPalClient()
+            try:
+                verification = client.verify_webhook_signature(headers, raw_body)
+            finally:
+                client.close()
+    except Exception as exc:
+        verification_status = "FAILURE" if isinstance(exc, ValueError) else "ERROR"
+        error_message = (
+            "PayPal rejected the webhook signature."
+            if isinstance(exc, ValueError)
+            else "Webhook verification could not be completed."
+        )
+        store_verification(verification_status, error_message)
         db.commit()
-        db.refresh(webhook_record)
+        raise WebhookVerificationError("Webhook verification failed.") from exc
 
-        return {
-            "status": "received",
-            "event_id": event_id,
-        }
+    if verification.get("verification_status") != "SUCCESS":
+        store_verification("FAILURE", "PayPal rejected the webhook signature.")
+        db.commit()
+        raise WebhookVerificationError("PayPal webhook signature is invalid.")
 
+    webhook_record = store_verification("SUCCESS", None)
+    try:
+        db.commit()
     except IntegrityError:
         db.rollback()
-
-        existing = (
-            db.query(PayPalWebhookEvent)
-            .filter(
-                PayPalWebhookEvent.paypal_event_id == event_id
-            )
-            .first()
+        existing = db.query(PayPalWebhookEvent).filter_by(
+            paypal_event_id=event_id
+        ).with_for_update().one()
+        if existing.verification_status == "SUCCESS":
+            return {"status": "duplicate", "event_id": event_id}
+        # A concurrent invalid delivery may have stored this event ID first.
+        # A now-verified event replaces its untrusted payload and proceeds.
+        existing.event_type = event_type
+        existing.resource_type = resource.get("resource_type")
+        existing.resource_id = resource.get("id")
+        existing.verification_status = "SUCCESS"
+        existing.processing_status = "RECEIVED"
+        existing.payload = event
+        existing.transmission_id = (
+            headers.get("paypal-transmission-id")
+            or headers.get("PAYPAL-TRANSMISSION-ID")
         )
-
-        if existing:
-            return {
-                "status": "duplicate",
-                "event_id": event_id,
-            }
-
-        raise
-
-    except Exception:
-        db.rollback()
-        raise
+        existing.error = None
+        webhook_record = existing
+        db.commit()
+    db.refresh(webhook_record)
+    return {"status": "received", "event_id": event_id}
 
 def _get_related_order_id(event: dict) -> str | None:
     """Extract the PayPal order ID from a webhook event."""
@@ -126,7 +162,25 @@ def _get_related_order_id(event: dict) -> str | None:
         .get("related_ids", {})
     )
 
-    return related_ids.get("order_id")
+    order_id = related_ids.get("order_id")
+    if order_id:
+        return order_id
+    for link in resource.get("links", []):
+        if link.get("rel") == "up":
+            href = link.get("href", "")
+            try:
+                parsed = urlsplit(href)
+                parts = parsed.path.rstrip("/").split("/")
+                if (parsed.scheme == "https"
+                        and parsed.hostname == "api-m.sandbox.paypal.com"
+                        and parsed.username is None and parsed.password is None
+                        and len(parts) == 5
+                        and parts[1:4] == ["v2", "checkout", "orders"]
+                        and parts[4]):
+                    return parts[4]
+            except (TypeError, ValueError):
+                continue
+    return None
 
 def _find_payment_for_order(
     db: Session,
@@ -224,10 +278,111 @@ def apply_verified_webhook(
         "PAYMENT.CAPTURE.COMPLETED",
         "PAYMENT.CAPTURE.PENDING",
         "PAYMENT.CAPTURE.DENIED",
+        "PAYMENT.CAPTURE.REFUNDED",
+        "PAYMENT.CAPTURE.REVERSED",
     }
 
     if event_type not in supported_events:
         return "ignored"
+
+    if event_type in {
+        "PAYMENT.CAPTURE.REFUNDED", "PAYMENT.CAPTURE.REVERSED"
+    }:
+        resource = event.get("resource", {})
+        related = resource.get("supplementary_data", {}).get("related_ids", {})
+        capture_id = related.get("capture_id")
+        if not capture_id:
+            for link in resource.get("links", []):
+                if link.get("rel") in {"up", "related"}:
+                    try:
+                        parsed = urlsplit(link.get("href", ""))
+                        parts = parsed.path.rstrip("/").split("/")
+                        if (parsed.scheme == "https"
+                                and parsed.hostname == "api-m.sandbox.paypal.com"
+                                and parts[-3:-1] == ["payments", "captures"]
+                                and parts[-1]):
+                            capture_id = parts[-1]
+                            break
+                    except (TypeError, ValueError):
+                        pass
+        if event_type == "PAYMENT.CAPTURE.REVERSED" and not capture_id:
+            capture_id = resource.get("id")
+        amount = resource.get("amount")
+        if not isinstance(capture_id, str) or not capture_id or not isinstance(amount, dict):
+            raise PayPalError("Refund or reversal details are incomplete.")
+        try:
+            value = Decimal(str(amount.get("value")))
+        except Exception as exc:
+            raise PayPalError("Refund or reversal amount is invalid.") from exc
+        currency = amount.get("currency_code")
+        if not value.is_finite() or value <= 0 or currency != "USD":
+            raise PayPalError("Refund or reversal amount or currency is invalid.")
+        payment = (
+            db.query(Payment)
+            .filter(Payment.paypal_capture_id == capture_id)
+            .with_for_update()
+            .first()
+        )
+        if payment is None:
+            return "ignored"
+        event_id = event.get("id")
+        financial_types = (
+            "PAYMENT.CAPTURE.REFUNDED", "PAYMENT.CAPTURE.REVERSED"
+        )
+        prior = db.query(PaymentEvent).filter(
+            PaymentEvent.payment_id == payment.id,
+            PaymentEvent.event_type.in_(financial_types),
+            PaymentEvent.paypal_ref == capture_id,
+        ).all()
+        recorded_ids = set()
+        adjusted = Decimal("0")
+        for row in prior:
+            details = row.details or {}
+            provider_event_id = details.get("provider_event_id")
+            if not provider_event_id or provider_event_id in recorded_ids:
+                continue
+            recorded_ids.add(provider_event_id)
+            try:
+                adjusted += Decimal(str(details.get("amount", "0")))
+            except Exception:
+                continue
+        already_recorded = event_id in recorded_ids
+        if adjusted + (Decimal("0") if already_recorded else value) > payment.amount:
+            raise PayPalError("Refund or reversal exceeds the captured amount.")
+        if not already_recorded:
+            try:
+                _record_event(
+                    db, payment, event_type, "WEBHOOK",
+                    from_status=payment.status, to_status=payment.status,
+                    paypal_ref=capture_id,
+                    details={"provider_event_id": event_id, "capture_id": capture_id,
+                             "amount": str(value), "currency": currency,
+                             "provider_resource_id": resource.get("id"),
+                             "resource": resource},
+                )
+                audit.record(
+                    db, actor_id=None,
+                    action=f"payment.{event_type.lower().removeprefix('payment.')}",
+                    entity_type="payment", entity_id=payment.id,
+                    details={"provider_event_id": event_id, "capture_id": capture_id,
+                             "amount": str(value), "currency": currency},
+                )
+                project = payment.milestone.project
+                recipients = {payment.payer_id}
+                if project.freelancer_id is not None:
+                    recipients.add(project.freelancer_id)
+                for recipient_id in recipients:
+                    notifications.notify(
+                        db, user_id=recipient_id,
+                        event_type=event_type.lower(),
+                        payload={"payment_id": payment.id, "capture_id": capture_id,
+                                 "amount": str(value), "currency": currency},
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        return "processed"
 
     order_id = _get_related_order_id(event)
 
@@ -258,6 +413,7 @@ def apply_verified_webhook(
             return "ignored"
 
         client = _get_payment_client(payment.provider)
+        _restore_mock_order(payment)
         order = client.get_order(order_id)
 
         if order.get("id") != order_id:
@@ -265,9 +421,19 @@ def apply_verified_webhook(
                 "PayPal returned an unexpected order ID."
             )
 
-        _validate_order_amount(order, payment)
+        try:
+            _validate_order_amount(order, payment)
+        except AmountMismatchError:
+            _persist_amount_mismatch(db, payment, None, order_id)
+            raise
 
         capture = _get_order_capture(order)
+        if event_type.startswith("PAYMENT.CAPTURE.") and capture:
+            try:
+                _validate_amount_fields(capture.get("amount", {}), payment)
+            except AmountMismatchError:
+                _persist_amount_mismatch(db, payment, None, capture.get("id") or order_id)
+                raise
 
         if event_type == "CHECKOUT.ORDER.APPROVED":
             if order.get("status") != "APPROVED":
@@ -296,11 +462,10 @@ def apply_verified_webhook(
 
             capture_amount = capture.get("amount", {})
 
-            if (
-                capture_amount.get("currency_code") != payment.currency
-                or Decimal(str(capture_amount.get("value", "0")))
-                != payment.amount
-            ):
+            try:
+                _validate_amount_fields(capture_amount, payment)
+            except AmountMismatchError:
+                _persist_amount_mismatch(db, payment, None, capture.get("id"))
                 raise AmountMismatchError(
                     "PayPal capture amount or currency does not match payment."
                 )
@@ -349,7 +514,7 @@ def apply_verified_webhook(
                     "Payment and milestone relationship is inconsistent."
                 )
 
-            milestones.mark_paid(db, milestone.id, payment.id)
+            _mark_milestone_paid(db, payment, None)
 
             project = milestone.project
 
@@ -444,3 +609,34 @@ def apply_verified_webhook(
     finally:
         if client is not None:
             client.close()
+
+
+def process_webhook(db: Session, *, headers: dict, raw_body: bytes) -> dict:
+    """Receive, verify, deduplicate, reconcile, and persist webhook outcome."""
+    receipt = receive_webhook(db, headers=headers, raw_body=raw_body)
+    if receipt["status"] == "duplicate":
+        return receipt
+
+    record = db.query(PayPalWebhookEvent).filter_by(
+        paypal_event_id=receipt["event_id"]
+    ).with_for_update().one()
+    try:
+        if record.verification_status != "SUCCESS":
+            return {"status": "failed", "event_id": receipt["event_id"]}
+        outcome = apply_verified_webhook(db, event=record.payload)
+        record.processing_status = (
+            "PROCESSED" if outcome == "processed" else "IGNORED"
+        )
+        record.processed_at = datetime.now(timezone.utc)
+        db.commit()
+        return {"status": outcome, "event_id": receipt["event_id"]}
+    except Exception as exc:
+        db.rollback()
+        record = db.query(PayPalWebhookEvent).filter_by(
+            paypal_event_id=receipt["event_id"]
+        ).with_for_update().one()
+        record.processing_status = "FAILED"
+        record.error = f"Webhook processing failed: {type(exc).__name__}"
+        record.processed_at = datetime.now(timezone.utc)
+        db.commit()
+        return {"status": "failed", "event_id": receipt["event_id"]}

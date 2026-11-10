@@ -1,8 +1,10 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from app.payments.errors import AmountMismatchError
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.models import Payment, PaymentEvent
@@ -29,7 +31,7 @@ def _get_provider() -> str:
     if mode == "mock":
         return "MOCK"
 
-    if mode == "paypal":
+    if mode in {"paypal", "paypal_sandbox"}:
         return "PAYPAL"
 
     raise ValueError(f"Unsupported payment mode: {mode}")
@@ -45,6 +47,11 @@ def _get_payment_client(provider: str):
         return PayPalClient()
 
     raise ValueError(f"Unsupported payment provider: {provider}")
+
+
+def _restore_mock_order(payment: Payment) -> None:
+    if payment.provider == "MOCK" and payment.paypal_order_id:
+        MockPaymentClient.restore_order(payment.paypal_order_id, payment)
 
 
 def _record_event(
@@ -70,6 +77,50 @@ def _record_event(
             details=details or {},
         )
     )
+
+
+def _validate_provider_order(order: dict, payment: Payment) -> None:
+    units = order.get("purchase_units", [])
+    amount = units[0].get("amount", {}) if units else {}
+    try:
+        value = Decimal(str(amount.get("value")))
+    except Exception as exc:
+        raise AmountMismatchError("Provider order amount is invalid.") from exc
+    if (
+        amount.get("currency_code") != payment.currency
+        or not value.is_finite()
+        or value != payment.amount
+    ):
+        raise AmountMismatchError("Provider order amount or currency does not match payment.")
+
+
+def _validate_amount_fields(amount: dict, payment: Payment) -> None:
+    try:
+        value = Decimal(str(amount.get("value")))
+    except Exception as exc:
+        raise AmountMismatchError("Provider amount is invalid.") from exc
+    if (
+        amount.get("currency_code") != payment.currency
+        or not value.is_finite()
+        or value != payment.amount
+    ):
+        raise AmountMismatchError("Provider amount or currency does not match payment.")
+
+
+def _persist_amount_mismatch(
+    db: Session, payment: Payment, actor_id: int | None, provider_ref: str | None
+) -> None:
+    payment.failure_code = "AMOUNT_MISMATCH"
+    payment.failure_message = "Provider amount or currency did not match the local payment."
+    _transition_payment(
+        db, payment, PaymentStatus.FAILED, "AMOUNT_MISMATCH", "API",
+        actor_id, paypal_ref=provider_ref,
+    )
+    notifications.notify(
+        db, user_id=payment.payer_id, event_type="payment.failed",
+        payload={"payment_id": payment.id, "failure_code": "AMOUNT_MISMATCH"},
+    )
+    db.commit()
 
 
 def _transition_payment(
@@ -113,6 +164,21 @@ def _transition_payment(
         details=details or {},
     )
 
+
+def _mark_milestone_paid(db: Session, payment: Payment, actor_id: int | None) -> None:
+    milestone = payment.milestone
+    if milestone.id != payment.milestone_id or milestone.project_id != payment.project_id:
+        raise PayPalError("Payment and milestone relationship is inconsistent.")
+    milestones.mark_paid(db, milestone.id, payment.id)
+    audit.record(
+        db,
+        actor_id=actor_id,
+        action="milestone.paid",
+        entity_type="milestone",
+        entity_id=milestone.id,
+        details={"payment_id": payment.id},
+    )
+
 def create_order_for_milestone(
     db: Session,
     *,
@@ -130,35 +196,106 @@ def create_order_for_milestone(
         )
 
         project = milestone.project
-
+        amount = Decimal(str(milestone.amount))
+        try:
+            rounded_amount = amount.quantize(Decimal("0.01"))
+        except InvalidOperation as exc:
+            raise ValueError("Milestone amount is outside the supported USD range.") from exc
+        if (
+            not amount.is_finite()
+            or amount <= 0
+            or amount != rounded_amount
+        ):
+            raise ValueError("Milestone amount must be a positive USD amount with at most two decimal places.")
+        if (project.currency or "USD").upper() != "USD":
+            raise ValueError("Only USD milestone payments are supported.")
         if project.freelancer_id is None:
-            raise ValueError(
-                "Cannot create payment without an assigned freelancer."
+            raise ValueError("Cannot create payment without an assigned freelancer.")
+
+        # A repeated Pay click must reuse the live order.  The partial unique
+        # index remains the concurrency backstop when two requests race.
+        existing = (
+            db.query(Payment)
+            .filter(Payment.milestone_id == milestone.id)
+            .filter(Payment.status.in_([
+                PaymentStatus.CREATED.value,
+                PaymentStatus.PENDING_APPROVAL.value,
+            ]))
+            .with_for_update()
+            .first()
+        )
+        if existing is not None:
+            if (
+                existing.status == PaymentStatus.PENDING_APPROVAL.value
+                or existing.paypal_order_id
+            ):
+                existing._idempotent_reuse = True
+                db.commit()
+                db.refresh(existing)
+                return existing
+            # Resume an interrupted create using the same durable idempotency
+            # key. The row lock serializes concurrent recovery attempts.
+            payment = existing
+            provider = existing.provider
+        else:
+            payment = None
+
+        active = (
+            db.query(Payment)
+            .filter(Payment.milestone_id == milestone.id)
+            .filter(Payment.status.in_([
+                PaymentStatus.APPROVED.value,
+                PaymentStatus.CAPTURE_PENDING.value,
+                PaymentStatus.COMPLETED.value,
+            ]))
+            .first()
+        )
+        if active is not None:
+            raise InvalidPaymentStateError(
+                "A payment for this milestone is already being processed."
             )
 
-        provider = _get_provider()
-
-        # Create the local payment record.
-        payment = Payment(
-            milestone_id=milestone.id,
-            project_id=project.id,
-            payer_id=actor_id,
-            amount=Decimal(str(milestone.amount)).quantize(
-                Decimal("0.01")
-            ),
-            currency="USD",
-            status=PaymentStatus.CREATED.value,
-            provider=provider,
-            payee_mode=settings.payee_mode,
-            payee_email=(
-                project.freelancer.email
-                if settings.payee_mode == "direct_payee"
-                else None
-            ),
-        )
-
-        db.add(payment)
-        db.flush()
+        if payment is None:
+            provider = _get_provider()
+            payment = Payment(
+                milestone_id=milestone.id,
+                project_id=project.id,
+                payer_id=actor_id,
+                amount=rounded_amount,
+                currency="USD",
+                status=PaymentStatus.CREATED.value,
+                provider=provider,
+                payee_mode=settings.payee_mode,
+                payee_email=(
+                    project.freelancer.email
+                    if settings.payee_mode == "direct_payee"
+                    else None
+                ),
+            )
+            db.add(payment)
+            db.flush()
+            _record_event(
+                db, payment, "ORDER_REQUESTED", "API",
+                from_status=None, to_status=PaymentStatus.CREATED.value,
+                details={"provider": provider},
+            )
+            audit.record(
+                db, actor_id=actor_id, action="payment.created",
+                entity_type="payment", entity_id=payment.id,
+                details={"provider": provider},
+            )
+            db.commit()
+            # Reacquire the row lock after making CREATED durable. If another
+            # request completed the provider call first, reuse its order.
+            payment = (
+                db.query(Payment).filter(Payment.id == payment.id)
+                .with_for_update().one()
+            )
+            if payment.status == PaymentStatus.PENDING_APPROVAL.value:
+                payment._idempotent_reuse = True
+                db.commit()
+                db.refresh(payment)
+                return payment
 
         # Create the provider order.
         client = _get_payment_client(provider)
@@ -206,6 +343,19 @@ def create_order_for_milestone(
                 "Payment provider did not return an approval URL."
             )
 
+        if provider == "MOCK":
+            if not approval_link.startswith("/mock-paypal/checkout?"):
+                raise PayPalError("Mock provider returned an unsafe checkout URL.")
+        else:
+            approval_url = urlsplit(approval_link)
+            if (
+                approval_url.scheme != "https"
+                or approval_url.hostname != "www.sandbox.paypal.com"
+                or approval_url.username is not None
+                or approval_url.password is not None
+            ):
+                raise PayPalError("PayPal returned an unsafe Sandbox checkout URL.")
+
         provider_status = order.get("status")
 
         if provider_status not in ("CREATED", "PAYER_ACTION_REQUIRED"):
@@ -228,10 +378,77 @@ def create_order_for_milestone(
             details={"provider": provider},
         )
 
+        if project.freelancer_id is not None:
+            notifications.notify(
+                db,
+                user_id=project.freelancer_id,
+                event_type="payment.pending_approval",
+                payload={"payment_id": payment.id, "milestone_id": milestone.id,
+                        "project_id": project.id, "simulated": provider == "MOCK"},
+            )
+
         db.commit()
         db.refresh(payment)
 
         return payment
+
+    except PayPalError as exc:
+        if "payment" in locals() and payment.status == PaymentStatus.CREATED.value:
+            error_code = getattr(exc, "code", None)
+            status_code = getattr(exc, "status_code", None)
+            payment.failure_code = (error_code or "PAYPAL_ERROR")[:100]
+            payment.failure_message = str(exc)[:1000]
+            if status_code is not None and 400 <= status_code < 500:
+                _transition_payment(
+                    db, payment, PaymentStatus.FAILED, "ORDER_FAILED", "API",
+                    actor_id, details={"provider": payment.provider},
+                )
+                notifications.notify(
+                    db, user_id=payment.payer_id, event_type="payment.failed",
+                    payload={"payment_id": payment.id, "milestone_id": payment.milestone_id},
+                )
+            else:
+                # Network failures and server errors can happen after PayPal
+                # created the order. Keep CREATED and retry the same request
+                # ID so we cannot make an orphaned second order.
+                _record_event(
+                    db, payment, "ORDER_CREATE_RETRYABLE_FAILURE", "API",
+                    from_status=PaymentStatus.CREATED.value,
+                    to_status=PaymentStatus.CREATED.value,
+                    details={"provider": payment.provider},
+                )
+                audit.record(
+                    db, actor_id=actor_id, action="payment.order_retryable_failure",
+                    entity_type="payment", entity_id=payment.id,
+                    details={"provider": payment.provider},
+                )
+            db.commit()
+        else:
+            db.rollback()
+        raise
+    except IntegrityError as exc:
+        db.rollback()
+        # A concurrent create may have committed after our initial lookup.
+        existing = (
+            db.query(Payment)
+            .filter(Payment.milestone_id == milestone_id)
+            .filter(Payment.status.in_([
+                PaymentStatus.CREATED.value,
+                PaymentStatus.PENDING_APPROVAL.value,
+            ]))
+            .first()
+        )
+        if existing is not None:
+            if (existing.status == PaymentStatus.CREATED.value
+                    and not existing.paypal_order_id):
+                raise InvalidPaymentStateError(
+                    "Payment order creation is already being recovered; retry shortly."
+                ) from exc
+            existing._idempotent_reuse = True
+            return existing
+        raise InvalidPaymentStateError(
+            "A payment for this milestone already exists."
+        ) from exc
 
     except Exception:
         db.rollback()
@@ -288,33 +505,26 @@ def capture_payment(
             )
 
         client = _get_payment_client(payment.provider)
+        _restore_mock_order(payment)
 
         # Ask the provider for the authoritative order status.
         order = client.get_order(paypal_order_id)
 
         if order.get("status") != "APPROVED":
+            if order.get("status") == "COMPLETED":
+                return sync_payment(
+                    db, payment_id=payment_id, actor_id=actor_id
+                )
             raise InvalidPaymentStateError(
                 "PayPal order has not been approved."
             )
 
         # Validate the order amount before capturing.
-        purchase_units = order.get("purchase_units", [])
-
-        if not purchase_units:
-            raise AmountMismatchError(
-                "PayPal order does not contain purchase unit details."
-            )
-
-        order_amount = purchase_units[0].get("amount", {})
-
-        if (
-            order_amount.get("currency_code") != payment.currency
-            or Decimal(str(order_amount.get("value", "0")))
-            != payment.amount
-        ):
-            raise AmountMismatchError(
-                "PayPal order amount or currency does not match payment."
-            )
+        try:
+            _validate_provider_order(order, payment)
+        except AmountMismatchError:
+            _persist_amount_mismatch(db, payment, actor_id, paypal_order_id)
+            raise
 
         if payment.status == PaymentStatus.PENDING_APPROVAL.value:
             payment.approved_at = datetime.now(timezone.utc)
@@ -331,10 +541,44 @@ def capture_payment(
             )
 
         # Use a stable request ID for provider-side idempotency.
-        capture_result = client.capture_order(
-            paypal_order_id,
-            request_id=f"mm-capture-{payment.idempotency_key}",
-        )
+        try:
+            capture_result = client.capture_order(
+                paypal_order_id,
+                request_id=f"mm-capture-{payment.idempotency_key}",
+            )
+        except PayPalError as exc:
+            error_code = getattr(exc, "code", None)
+            status_code = getattr(exc, "status_code", None)
+            if error_code == "ORDER_ALREADY_CAPTURED":
+                return sync_payment(
+                    db, payment_id=payment_id, actor_id=actor_id
+                )
+            if error_code == "ORDER_NOT_APPROVED":
+                raise InvalidPaymentStateError(
+                    "PayPal order has not been approved yet."
+                ) from exc
+            # A definitive provider 4xx is safe to record as a failure. A
+            # timeout/5xx is ambiguous, so keep the state resumable and let
+            # sync/webhook reconciliation determine whether capture landed.
+            if status_code is not None and 400 <= status_code < 500:
+                target = (
+                    PaymentStatus.DENIED
+                    if error_code in {"INSTRUMENT_DECLINED", "PAYER_CANNOT_PAY"}
+                    else PaymentStatus.FAILED
+                )
+                payment.failure_code = (error_code or "PAYPAL_ERROR")[:100]
+                payment.failure_message = str(exc)[:1000]
+                _transition_payment(
+                    db, payment, target, "CAPTURE_REJECTED", "API",
+                    actor_id, paypal_ref=paypal_order_id,
+                )
+                notifications.notify(
+                    db, user_id=payment.payer_id,
+                    event_type=f"payment.{target.value.lower()}",
+                    payload={"payment_id": payment.id, "failure_code": payment.failure_code},
+                )
+                db.commit()
+            raise
 
         capture_status = capture_result.get("status")
 
@@ -359,11 +603,10 @@ def capture_payment(
 
             capture_amount = capture.get("amount", {})
 
-            if (
-                capture_amount.get("currency_code") != payment.currency
-                or Decimal(str(capture_amount.get("value", "0")))
-                != payment.amount
-            ):
+            try:
+                _validate_amount_fields(capture_amount, payment)
+            except AmountMismatchError:
+                _persist_amount_mismatch(db, payment, actor_id, capture.get("id"))
                 raise AmountMismatchError(
                     "Captured amount or currency does not match payment."
                 )
@@ -392,23 +635,8 @@ def capture_payment(
                 },
             )
 
-            # Verify the payment-to-milestone relationship before
-            # invoking the shared milestone service.
             milestone = payment.milestone
-
-            if (
-                milestone.id != payment.milestone_id
-                or milestone.project_id != payment.project_id
-            ):
-                raise PayPalError(
-                    "Payment and milestone relationship is inconsistent."
-                )
-
-            milestones.mark_paid(
-                db,
-                milestone.id,
-                payment.id,
-            )
+            _mark_milestone_paid(db, payment, actor_id)
 
             # Notify the freelancer after confirmed capture.
             project = milestone.project
@@ -428,39 +656,45 @@ def capture_payment(
                 )
 
         elif capture_status == "PENDING":
-          payment.paypal_capture_status = "PENDING"
-
-          if payment.status != PaymentStatus.CAPTURE_PENDING.value:
-            _transition_payment(
-             db=db,
-            payment=payment,
-            target=PaymentStatus.CAPTURE_PENDING,
-            event_type="CAPTURE_PENDING",
-            source="API",
-            actor_id=actor_id,
-            paypal_ref=paypal_order_id,
-        )
-          else:
-            _record_event(
-            db=db,
-            payment=payment,
-            event_type="CAPTURE_STILL_PENDING",
-            source="API",
-            from_status=PaymentStatus.CAPTURE_PENDING.value,
-            to_status=PaymentStatus.CAPTURE_PENDING.value,
-            paypal_ref=paypal_order_id,
-        )
-
-          audit.record(
-            db,
-            actor_id=actor_id,
-            action="payment.capture_pending",
-            entity_type="payment",
-            entity_id=payment.id,
-            details={"provider": payment.provider},
-        )
+            payment.paypal_capture_status = "PENDING"
+            if payment.status != PaymentStatus.CAPTURE_PENDING.value:
+                _transition_payment(
+                    db=db,
+                    payment=payment,
+                    target=PaymentStatus.CAPTURE_PENDING,
+                    event_type="CAPTURE_PENDING",
+                    source="API",
+                    actor_id=actor_id,
+                    paypal_ref=paypal_order_id,
+                )
+                notifications.notify(
+                    db,
+                    user_id=payment.payer_id,
+                    event_type="payment.capture_pending",
+                    payload={"payment_id": payment.id},
+                )
+            else:
+                _record_event(
+                    db=db,
+                    payment=payment,
+                    event_type="CAPTURE_STILL_PENDING",
+                    source="API",
+                    from_status=PaymentStatus.CAPTURE_PENDING.value,
+                    to_status=PaymentStatus.CAPTURE_PENDING.value,
+                    paypal_ref=paypal_order_id,
+                )
+                audit.record(
+                    db,
+                    actor_id=actor_id,
+                    action="payment.capture_pending",
+                    entity_type="payment",
+                    entity_id=payment.id,
+                    details={"provider": payment.provider},
+                )
 
         elif capture_status in ("DECLINED", "DENIED"):
+            payment.failure_code = capture_status
+            payment.failure_message = "PayPal declined the payment."
             _transition_payment(
                 db=db,
                 payment=payment,
@@ -469,6 +703,10 @@ def capture_payment(
                 source="API",
                 actor_id=actor_id,
                 paypal_ref=paypal_order_id,
+            )
+            notifications.notify(
+                db, user_id=payment.payer_id, event_type="payment.denied",
+                payload={"payment_id": payment.id, "milestone_id": payment.milestone_id},
             )
 
         else:
@@ -533,11 +771,89 @@ def cancel_payment(
             paypal_ref=payment.paypal_order_id,
         )
 
+        project = payment.milestone.project
+        if project.freelancer_id is not None:
+            notifications.notify(
+                db, user_id=project.freelancer_id, event_type="payment.cancelled",
+                payload={"payment_id": payment.id, "milestone_id": payment.milestone_id,
+                         "project_id": payment.project_id},
+            )
+
         db.commit()
         db.refresh(payment)
 
         return payment
 
+    except Exception:
+        db.rollback()
+        raise
+
+
+def reject_mock_payment(db: Session, *, order_id: str) -> Payment:
+    """Apply an explicit simulated buyer rejection to a mock payment."""
+    try:
+        payment = (
+            db.query(Payment)
+            .filter(Payment.paypal_order_id == order_id)
+            .with_for_update()
+            .first()
+        )
+        if payment is None or payment.provider != "MOCK":
+            raise PaymentNotFoundError("Mock payment not found.")
+        if payment.status != PaymentStatus.PENDING_APPROVAL.value:
+            raise InvalidPaymentStateError(
+                f"Cannot reject payment in state {payment.status}."
+            )
+        _restore_mock_order(payment)
+        MockPaymentClient.reject_order(order_id)
+        payment.failure_code = "SIMULATED_REJECTION"
+        payment.failure_message = "Buyer rejected this simulated payment."
+        _transition_payment(
+            db, payment, PaymentStatus.DENIED, "PAYMENT_REJECTED", "USER",
+            actor_id=payment.payer_id, paypal_ref=order_id,
+            details={"simulated": True},
+        )
+        notifications.notify(
+            db,
+            user_id=payment.payer_id,
+            event_type="payment.denied",
+            payload={"payment_id": payment.id, "simulated": True},
+        )
+        db.commit()
+        db.refresh(payment)
+        return payment
+    except Exception:
+        db.rollback()
+        raise
+
+
+def approve_mock_payment(db: Session, *, order_id: str) -> Payment:
+    """Persist simulated buyer approval so it survives an app restart."""
+    try:
+        payment = (
+            db.query(Payment).filter(Payment.paypal_order_id == order_id)
+            .with_for_update().first()
+        )
+        if payment is None or payment.provider != "MOCK":
+            raise PaymentNotFoundError("Mock payment not found.")
+        if payment.status == PaymentStatus.APPROVED.value:
+            return payment
+        if payment.status != PaymentStatus.PENDING_APPROVAL.value:
+            raise InvalidPaymentStateError(
+                f"Cannot approve payment in state {payment.status}."
+            )
+        _restore_mock_order(payment)
+        MockPaymentClient.approve_order(order_id)
+        payment.approved_at = datetime.now(timezone.utc)
+        payment.paypal_order_status = "APPROVED"
+        _transition_payment(
+            db, payment, PaymentStatus.APPROVED, "ORDER_APPROVED", "USER",
+            actor_id=payment.payer_id, paypal_ref=order_id,
+            details={"simulated": True},
+        )
+        db.commit()
+        db.refresh(payment)
+        return payment
     except Exception:
         db.rollback()
         raise
@@ -562,7 +878,8 @@ def sync_payment(
         if payment is None:
             raise PaymentNotFoundError("Payment not found.")
 
-        if payment.payer_id != actor_id:
+        project = payment.milestone.project
+        if actor_id != payment.payer_id:
             raise PaymentAuthorizationError(
                 "Only the payment's client can synchronize it."
             )
@@ -581,8 +898,17 @@ def sync_payment(
             raise PayPalError("Payment has no provider order ID.")
 
         client = _get_payment_client(payment.provider)
+        _restore_mock_order(payment)
 
         order = client.get_order(payment.paypal_order_id)
+        if order.get("id") != payment.paypal_order_id:
+            raise PayPalError("Provider returned an unexpected order ID.")
+        if order.get("status") in ("APPROVED", "COMPLETED"):
+            try:
+                _validate_provider_order(order, payment)
+            except AmountMismatchError:
+                _persist_amount_mismatch(db, payment, actor_id, payment.paypal_order_id)
+                raise
         provider_status = order.get("status")
 
         payment.paypal_order_status = provider_status
@@ -629,86 +955,91 @@ def sync_payment(
 
             capture = captures[0]
             capture_amount = capture.get("amount", {})
-
-            if (
-                capture.get("status") != "COMPLETED"
-                or capture_amount.get("currency_code") != payment.currency
-                or Decimal(str(capture_amount.get("value", "0")))
-                != payment.amount
-            ):
-                raise AmountMismatchError(
-                    "Provider capture does not match the expected payment."
-                )
-
-            capture_id = capture.get("id")
-
-            if not capture_id:
-                raise PayPalError(
-                    "Provider did not return a capture ID."
-                )
-
-            if payment.status == PaymentStatus.PENDING_APPROVAL.value:
-                payment.approved_at = datetime.now(timezone.utc)
-
+            if capture.get("status") == "PENDING":
+                try:
+                    _validate_amount_fields(capture_amount, payment)
+                except AmountMismatchError:
+                    _persist_amount_mismatch(db, payment, actor_id, capture.get("id"))
+                    raise
+                if payment.status == PaymentStatus.PENDING_APPROVAL.value:
+                    payment.approved_at = datetime.now(timezone.utc)
+                    _transition_payment(
+                        db, payment, PaymentStatus.APPROVED, "ORDER_APPROVED",
+                        "API", actor_id, paypal_ref=payment.paypal_order_id,
+                    )
+                if payment.status == PaymentStatus.APPROVED.value:
+                    payment.paypal_capture_status = "PENDING"
+                    payment.paypal_capture_id = capture.get("id")
+                    _transition_payment(
+                        db, payment, PaymentStatus.CAPTURE_PENDING,
+                        "CAPTURE_PENDING", "API", actor_id,
+                        paypal_ref=payment.paypal_order_id,
+                    )
+                    notifications.notify(
+                        db, user_id=payment.payer_id,
+                        event_type="payment.capture_pending",
+                        payload={"payment_id": payment.id},
+                    )
+                elif payment.status == PaymentStatus.CAPTURE_PENDING.value:
+                    _record_event(
+                        db, payment, "CAPTURE_STILL_PENDING", "API",
+                        from_status=payment.status, to_status=payment.status,
+                        paypal_ref=payment.paypal_order_id,
+                    )
+                else:
+                    raise InvalidPaymentStateError(
+                        f"Cannot synchronize payment in state {payment.status}."
+                    )
+            elif capture.get("status") in {"DENIED", "DECLINED"}:
+                payment.failure_code = capture.get("status")
+                payment.failure_message = "PayPal declined the capture."
                 _transition_payment(
-                    db=db,
-                    payment=payment,
-                    target=PaymentStatus.APPROVED,
-                    event_type="ORDER_APPROVED",
-                    source="API",
-                    actor_id=actor_id,
-                    paypal_ref=payment.paypal_order_id,
+                    db, payment, PaymentStatus.DENIED, "CAPTURE_DENIED", "API",
+                    actor_id, paypal_ref=capture.get("id") or payment.paypal_order_id,
                 )
-
-            payment.paypal_capture_id = capture_id
-            payment.paypal_capture_status = "COMPLETED"
-            payment.captured_at = datetime.now(timezone.utc)
-
-            _transition_payment(
-                db=db,
-                payment=payment,
-                target=PaymentStatus.COMPLETED,
-                event_type="CAPTURE_RECONCILED",
-                source="API",
-                actor_id=actor_id,
-                paypal_ref=capture_id,
-                details={
-                    "amount": str(payment.amount),
-                    "currency": payment.currency,
-                },
-            )
-
-            milestone = payment.milestone
-
-            if (
-                milestone.id != payment.milestone_id
-                or milestone.project_id != payment.project_id
-            ):
-                raise PayPalError(
-                    "Payment and milestone relationship is inconsistent."
-                )
-
-            milestones.mark_paid(
-                db,
-                milestone.id,
-                payment.id,
-            )
-
-            project = milestone.project
-
-            if project.freelancer_id is not None:
                 notifications.notify(
-                    db,
-                    user_id=project.freelancer_id,
-                    event_type="payment.completed",
-                    payload={
-                        "project_id": project.id,
-                        "milestone_id": milestone.id,
-                        "payment_id": payment.id,
-                        "amount": str(payment.amount),
-                        "currency": payment.currency,
-                    },
+                    db, user_id=payment.payer_id, event_type="payment.denied",
+                    payload={"payment_id": payment.id, "milestone_id": payment.milestone_id},
                 )
+            elif capture.get("status") != "COMPLETED":
+                raise PayPalError("Provider order is complete without a completed capture.")
+            else:
+                try:
+                    _validate_amount_fields(capture_amount, payment)
+                except AmountMismatchError:
+                    _persist_amount_mismatch(db, payment, actor_id, capture.get("id"))
+                    raise
+
+                capture_id = capture.get("id")
+                if not capture_id:
+                    raise PayPalError("Provider did not return a capture ID.")
+                if payment.status == PaymentStatus.PENDING_APPROVAL.value:
+                    payment.approved_at = datetime.now(timezone.utc)
+                    _transition_payment(
+                        db=db, payment=payment, target=PaymentStatus.APPROVED,
+                        event_type="ORDER_APPROVED", source="API",
+                        actor_id=actor_id, paypal_ref=payment.paypal_order_id,
+                    )
+                payment.paypal_capture_id = capture_id
+                payment.paypal_capture_status = "COMPLETED"
+                payment.captured_at = datetime.now(timezone.utc)
+                _transition_payment(
+                    db=db, payment=payment, target=PaymentStatus.COMPLETED,
+                    event_type="CAPTURE_RECONCILED", source="API",
+                    actor_id=actor_id, paypal_ref=capture_id,
+                    details={"amount": str(payment.amount), "currency": payment.currency},
+                )
+                milestone = payment.milestone
+                _mark_milestone_paid(db, payment, actor_id)
+                project = milestone.project
+                if project.freelancer_id is not None:
+                    notifications.notify(
+                        db, user_id=project.freelancer_id,
+                        event_type="payment.completed",
+                        payload={"project_id": project.id, "milestone_id": milestone.id,
+                                 "payment_id": payment.id, "amount": str(payment.amount),
+                                 "currency": payment.currency},
+                    )
 
         elif provider_status == "VOIDED":
 
