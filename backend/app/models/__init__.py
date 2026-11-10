@@ -10,6 +10,7 @@ from app.models.entities import (
     PaymentEvent,
     PayPalWebhookEvent,
 )
+from app.models.shared import AuditLog, Notification
 
 __all__ = [
     "Base",
@@ -22,4 +23,6 @@ __all__ = [
     "Payment",
     "PaymentEvent",
     "PayPalWebhookEvent",
+    "AuditLog",
+    "Notification",
 ]
