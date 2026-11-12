@@ -2,6 +2,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi import FastAPI
 from sqlalchemy import text
@@ -70,7 +71,13 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.frontend_base_url],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Existing application routes
 app.include_router(users_router)
