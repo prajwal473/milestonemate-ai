@@ -15,8 +15,17 @@ class Settings(BaseSettings):
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+
+    # AI configuration
+    ai_mode: str = "live"
+    llm_provider: str = "gemini"
+    ai_timeout_seconds: int = 45
+    ai_max_retries: int = 2
+    ai_calls_per_user_per_hour: int = 20
+
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.8-flash"
+
     # Payment configuration
     payments_mode: str = "mock"
 

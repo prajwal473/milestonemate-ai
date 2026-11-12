@@ -373,3 +373,20 @@ class PayPalWebhookEvent(Base):
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+class EvaluationRun(TimestampMixin, Base):
+    __tablename__ = "evaluation_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deliverable_id: Mapped[int] = mapped_column(
+        ForeignKey("deliverables.id"), nullable=False, unique=True
+    )
+
+    status: Mapped[str] = mapped_column(String(30), default="PENDING")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
