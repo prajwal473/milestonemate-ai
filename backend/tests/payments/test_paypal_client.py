@@ -37,12 +37,48 @@ def paypal_client(monkeypatch):
                 },
             )
 
+        if (
+            request.method == "GET"
+            and request.url.path == "/v2/checkout/orders/TEST_ORDER_123"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "TEST_ORDER_123",
+                    "status": "APPROVED",
+                    "purchase_units": [
+                        {
+                            "amount": {
+                                "currency_code": "USD",
+                                "value": "500.00",
+                            }
+                        }
+                    ],
+                },
+            )
+
         if request.url.path.endswith("/capture"):
             return httpx.Response(
                 201,
                 json={
                     "id": "TEST_ORDER_123",
                     "status": "COMPLETED",
+                    "purchase_units": [
+                        {
+                            "payments": {
+                                "captures": [
+                                    {
+                                        "id": "TEST_CAPTURE_123",
+                                        "status": "COMPLETED",
+                                        "amount": {
+                                            "currency_code": "USD",
+                                            "value": "500.00",
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ],
                 },
             )
 
@@ -350,7 +386,7 @@ def test_webhook_signature_verification(monkeypatch):
         "PAYPAL-TRANSMISSION-TIME": "2026-11-09T12:00:00Z",
     }
 
-    raw_body = b'{"id":"WH-123","event_type":"PAYMENT.CAPTURE.COMPLETED"}'
+    raw_body = b'{ "id" : "WH-123", "event_type" : "PAYMENT.CAPTURE.COMPLETED" }'
 
     try:
         result = client.verify_webhook_signature(headers, raw_body)
@@ -370,6 +406,7 @@ def test_webhook_signature_verification(monkeypatch):
         assert payload["webhook_id"] == "WEBHOOK_TEST_123"
         assert payload["webhook_event"]["id"] == "WH-123"
         assert payload["auth_algo"] == "SHA256withRSA"
+        assert raw_body in verification_request.content
 
     finally:
         client.close()

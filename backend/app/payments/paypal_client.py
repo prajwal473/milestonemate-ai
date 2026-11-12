@@ -12,6 +12,23 @@ from app.core.config import settings
 from app.payments.errors import PayPalError
 
 
+class PayPalResponseError(PayPalError):
+    """PayPal HTTP error with structured fields for safe reconciliation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        debug_id: str | None = None,
+        status_code: int | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.debug_id = debug_id
+        self.status_code = status_code
+
+
 class PayPalClient:
     """Client for PayPal REST API (Sandbox only)."""
 
@@ -33,7 +50,7 @@ class PayPalClient:
             or parsed_url.password is not None
         ):
             raise ValueError("Only PayPal Sandbox is supported.")
-        self.http = httpx.Client(           
+        self.http = httpx.Client(
             base_url=self.api_base,
             timeout=httpx.Timeout(15.0, connect=5.0),
             transport=transport,
@@ -60,7 +77,7 @@ class PayPalClient:
                 return self._access_token
 
             if not self.client_id or not self.client_secret:
-                raise PayPalError(
+                raise PayPalResponseError(
                     "PayPal Sandbox credentials are not configured."
                 )
 
@@ -178,7 +195,10 @@ class PayPalClient:
 
                 raise PayPalError(
                     f"{name}: {issue or message} "
-                    f"(debug_id={debug_id})"
+                    f"(debug_id={debug_id})",
+                    code=issue or name,
+                    debug_id=debug_id,
+                    status_code=response.status_code,
                 )
 
             try:
@@ -364,17 +384,25 @@ class PayPalClient:
             webhook_event = json.loads(raw_body)
         except (UnicodeDecodeError, ValueError) as exc:
             raise ValueError("Invalid webhook JSON.") from exc
+        if not isinstance(webhook_event, dict):
+            raise ValueError("Webhook event must be a JSON object.")
 
-        payload = {
+        # Preserve the original event JSON bytes inside the verification
+        # request. PayPal signs the delivered representation; parsing and
+        # serializing it again can change whitespace or numeric formatting.
+        raw_event = raw_body.decode("utf-8").strip()
+        prefix = {
             **verification_data,
             "webhook_id": webhook_id,
-            "webhook_event": webhook_event,
         }
+        prefix_json = json.dumps(prefix, separators=(",", ":"))
+        payload = prefix_json[:-1] + ',"webhook_event":' + raw_event + "}"
 
         return self._request(
             "POST",
             "/v1/notifications/verify-webhook-signature",
-            json_body=payload,
+            content=payload,
+            headers={"Content-Type": "application/json"},
         )
 
     # --------------------------------------------------
